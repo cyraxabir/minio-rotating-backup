@@ -7,7 +7,7 @@ The workflow is designed to:
 * Back up all MinIO buckets.
 * Synchronize the latest/current objects.
 * Reuse existing dated backup directories on a 2-day rotation.
-* Create as many date-based directories as required to support the rotation, using the format YYYY-MM-DD (e.g., 2026-09-15).
+* Create as many date-based directories as required inside BACKUP_ROOT dir to support the rotation, using the format YYYY-MM-DD (e.g., 2026-09-15).
 * Prevent multiple backup processes from running simultaneously.
 * Record output in daily log files.
 * Treat individual object failures as **warnings**, not fatal errors — the backup continues through all buckets.
