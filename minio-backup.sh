@@ -12,18 +12,11 @@ set -u
 # Destination:
 #   /MINIO-BACKUP/YYYY-MM-DD/<bucket>
 #
-# Storage:
-#   ~300 GB source
-#   ~650 GB backup disk
-#
 # Strategy:
-#   1. Keep two backup directories.
+#   1. Keep two backup directories for 2 days backup.
 #   2. Find the oldest backup directory.
 #   3. Mirror the current MinIO data INTO that directory.
 #   4. Only after ALL buckets succeed, rename it to today's date.
-#
-# IMPORTANT:
-#   No third 300 GB temporary backup is created.
 # ============================================================
 
 # -----------------------------

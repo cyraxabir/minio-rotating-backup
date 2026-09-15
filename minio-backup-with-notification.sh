@@ -12,7 +12,7 @@ set -u
 #   /MINIO-BACKUP/YYYY-MM-DD/<bucket>
 #
 # Strategy:
-#   1. Keep two backup directories.
+#   1. Keep two backup directories for 2 days backup.
 #   2. Find the oldest backup directory.
 #   3. Mirror current MinIO data into that directory.
 #   4. Individual object failures do NOT stop the backup.
