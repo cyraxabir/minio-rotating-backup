@@ -6,7 +6,7 @@ set -u
 # MinIO 2-Day Rotating Backup
 #
 # Source:
-#   MinIO alias: minio-231-backup
+#   MinIO alias: <minio-alias-name>
 #
 # Destination:
 #   /MINIO-BACKUP/YYYY-MM-DD/<bucket>
@@ -37,7 +37,7 @@ set -u
 # -----------------------------
 # Configuration
 # -----------------------------
-MINIO_ALIAS="minio-231-backup"
+MINIO_ALIAS="<minio-alias>"
 BACKUP_ROOT="/MINIO-BACKUP"
 LOG_DIR="${BACKUP_ROOT}/logs"
 LOCK_FILE="/tmp/minio-backup.lock"
