@@ -18,6 +18,12 @@ The workflow is designed to:
 > **Key behavioural note:** object-level and bucket-level failures do **not** abort the backup. Only infrastructure failures do (see [Exit Behaviour](#exit-behaviour)).
 
 ---
+## Accesskey permission for MC
+* safe for backup mc to give minimal read permission to all the buckets in order to avoid any unwanted incident to the source bucket
+* the required minimum permissions are listed on access-permission.json file.
+* prepare accesskey for backup mc according to the access-permission.json file
+
+--- 
 
 ## Workflow
 
