@@ -6,13 +6,13 @@ set -u
 # MinIO 2-Day Rotating Backup
 #
 # Source:
-#   MinIO alias: <minio-alias-name>
+#   MinIO alias: <your-minio-alias>
 #
 # Destination:
 #   /MINIO-BACKUP/YYYY-MM-DD/<bucket>
 #
 # Strategy:
-#   1. Keep two backup directories for 2 days backup.
+#   1. Keep two backup directories.
 #   2. Find the oldest backup directory.
 #   3. Mirror current MinIO data into that directory.
 #   4. Individual object failures do NOT stop the backup.
@@ -37,14 +37,14 @@ set -u
 # -----------------------------
 # Configuration
 # -----------------------------
-MINIO_ALIAS="<minio-alias>"
+MINIO_ALIAS="<your-minio-alias>"
 BACKUP_ROOT="/MINIO-BACKUP"
 LOG_DIR="${BACKUP_ROOT}/logs"
 LOCK_FILE="/tmp/minio-backup.lock"
 
 # Discord webhook URL for failure notifications.
 # Leave empty to disable notifications entirely.
-DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/XXXXXXXXXX/XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+DISCORD_WEBHOOK_URL="<your-discord-webhook-url>"
 
 TODAY="$(date '+%Y-%m-%d')"
 LOG_FILE="${LOG_DIR}/backup-${TODAY}.log"
@@ -396,10 +396,132 @@ echo "Failed objects queued      : $FAILED_OBJECT_COUNT"
 echo
 
 echo "All buckets have been processed."
-echo "The backup directory will now be finalized."
+echo "The retry pass will run next; the backup directory is"
+echo "finalized (renamed to today's date) only after that."
 
 # ============================================================
-# Rename reused directory to today's date
+# Retry failed objects ONCE
+#
+# NOTE:
+#   mc mirror only accepts a FOLDER as its source and cannot
+#   be pointed at a single object (it errors with "Source ...
+#   is not a folder. Only folders are supported by mirror
+#   command."). mc cp is built for exactly the opposite case:
+#   copying one specific object. Since this retry pulls a
+#   single object FROM the bucket DOWN to local disk (the same
+#   direction as the main backup), mc cp is the correct tool
+#   here.
+# ============================================================
+
+echo
+echo "============================================================"
+echo "FAILED OBJECT RETRY PASS"
+echo "============================================================"
+
+if [ ! -s "$FAILED_OBJECTS_FILE" ]; then
+
+    echo "No failed objects require retry."
+
+else
+
+    while IFS= read -r SOURCE_PATH; do
+
+        [ -z "$SOURCE_PATH" ] && continue
+
+        echo
+        echo "------------------------------------------------------------"
+        echo "Retrying failed object:"
+        echo "  $SOURCE_PATH"
+        echo "------------------------------------------------------------"
+
+        # ----------------------------------------------------
+        # Parse bucket/object regardless of whether mc reported
+        # the source as "<alias>/<bucket>/<key>" or as a full
+        # URL ("scheme://host/<bucket>/<key>").
+        # ----------------------------------------------------
+
+        if [[ "$SOURCE_PATH" == *"://"* ]]; then
+            SOURCE_REST="${SOURCE_PATH#*://}"
+            REL_PATH="${SOURCE_REST#*/}"
+        else
+            REL_PATH="${SOURCE_PATH#"${MINIO_ALIAS}/"}"
+        fi
+
+        SPLIT_BUCKET="${REL_PATH%%/*}"
+        SPLIT_OBJECT="${REL_PATH#*/}"
+
+        if [ -z "$SPLIT_BUCKET" ] || [ -z "$SPLIT_OBJECT" ] || [ "$SPLIT_OBJECT" = "$REL_PATH" ]; then
+
+            echo "ERROR: Could not determine bucket/object from:"
+            echo "  $SOURCE_PATH"
+
+            printf '%s\n' "$SOURCE_PATH" >> "$RETRY_FAILED_FILE"
+            RETRY_FAILED_COUNT=$((RETRY_FAILED_COUNT + 1))
+
+            continue
+        fi
+
+        # ----------------------------------------------------
+        # Decode common %XX sequences. Harmless no-op if the
+        # object key contains no such sequences.
+        # ----------------------------------------------------
+
+        DECODED_OBJECT="$(
+            printf '%b' "${SPLIT_OBJECT//%/\\x}" 2>/dev/null
+        )"
+
+        if [ -n "$DECODED_OBJECT" ]; then
+            SPLIT_OBJECT="$DECODED_OBJECT"
+        fi
+
+        RETRY_SOURCE="${MINIO_ALIAS}/${SPLIT_BUCKET}/${SPLIT_OBJECT}"
+        RETRY_DEST="${TARGET_DIR}/${SPLIT_BUCKET}/${SPLIT_OBJECT}"
+
+        mkdir -p "$(dirname "$RETRY_DEST")"
+
+        echo "Retry source:"
+        echo "  $RETRY_SOURCE"
+        echo "Retry destination:"
+        echo "  $RETRY_DEST"
+
+        # ----------------------------------------------------
+        # Retry once, using mc cp for this single object.
+        # ----------------------------------------------------
+
+        if mc cp \
+            "$RETRY_SOURCE" \
+            "$RETRY_DEST"; then
+
+            echo "RETRY SUCCESS:"
+            echo "  $SOURCE_PATH"
+
+            printf '%s\n' "$SOURCE_PATH" >> "$RETRY_SUCCESS_FILE"
+            RETRY_SUCCESS_COUNT=$((RETRY_SUCCESS_COUNT + 1))
+
+        else
+
+            echo "RETRY FAILED:"
+            echo "  $SOURCE_PATH"
+
+            printf '%s\n' "$SOURCE_PATH" >> "$RETRY_FAILED_FILE"
+            RETRY_FAILED_COUNT=$((RETRY_FAILED_COUNT + 1))
+        fi
+
+    done < "$FAILED_OBJECTS_FILE"
+
+fi
+
+# ============================================================
+# Finalize: rename the working directory to today's date
+#
+# NOTE:
+#   This happens ONLY NOW — after both the main backup AND the
+#   retry pass have fully completed. If the script were to
+#   crash mid-retry, the directory would still carry its old
+#   (in-progress) name, so the next run correctly detects it
+#   as unfinished and resumes it, instead of a half-retried
+#   backup being mistaken for a completed one stamped with
+#   today's date.
 # ============================================================
 
 FINAL_DIR="${BACKUP_ROOT}/${TODAY}"
@@ -441,123 +563,6 @@ else
     echo
     echo "Backup directory already has today's date:"
     echo "  $FINAL_DIR"
-fi
-
-# ============================================================
-# Retry failed objects ONCE
-#
-# NOTE:
-#   mc cp does not reliably restore an object into a MinIO
-#   bucket destination, so the retry pass reuses the same
-#   command as the main backup pass: mc mirror.
-# ============================================================
-
-echo
-echo "============================================================"
-echo "FAILED OBJECT RETRY PASS"
-echo "============================================================"
-
-if [ ! -s "$FAILED_OBJECTS_FILE" ]; then
-
-    echo "No failed objects require retry."
-
-else
-
-    while IFS= read -r SOURCE_URL; do
-
-        [ -z "$SOURCE_URL" ] && continue
-
-        echo
-        echo "------------------------------------------------------------"
-        echo "Retrying failed object:"
-        echo "  $SOURCE_URL"
-        echo "------------------------------------------------------------"
-
-        # ----------------------------------------------------
-        # Convert:
-        #
-        # https://host/bucket/path/to/object
-        #
-        # into:
-        #
-        # bucket = bucket
-        # object = path/to/object
-        # ----------------------------------------------------
-
-        SOURCE_REST="${SOURCE_URL#*://}"
-        SOURCE_PATH="${SOURCE_REST#*/}"
-
-        SOURCE_BUCKET="${SOURCE_PATH%%/*}"
-        OBJECT_PATH="${SOURCE_PATH#*/}"
-
-        # If the URL did not contain an object path, skip it.
-        if [ -z "$SOURCE_BUCKET" ] || [ -z "$OBJECT_PATH" ]; then
-
-            echo "ERROR: Could not determine bucket/object from:"
-            echo "  $SOURCE_URL"
-
-            printf '%s\n' "$SOURCE_URL" >> "$RETRY_FAILED_FILE"
-
-            RETRY_FAILED_COUNT=$((RETRY_FAILED_COUNT + 1))
-
-            continue
-        fi
-
-        # ----------------------------------------------------
-        # Decode common URL-encoded characters.
-        #
-        # Examples:
-        #   %20 -> space
-        #   %2F -> /
-        #   %40 -> @
-        #
-        # Bash printf handles \xHH sequences.
-        # ----------------------------------------------------
-
-        DECODED_OBJECT_PATH="$(
-            printf '%b' "${OBJECT_PATH//%/\\x}" 2>/dev/null
-        )"
-
-        if [ -z "$DECODED_OBJECT_PATH" ]; then
-            DECODED_OBJECT_PATH="$OBJECT_PATH"
-        fi
-
-        RETRY_DEST="${FINAL_DIR}/${SOURCE_BUCKET}/${DECODED_OBJECT_PATH}"
-
-        mkdir -p "$(dirname "$RETRY_DEST")"
-
-        echo "Retry destination:"
-        echo "  $RETRY_DEST"
-
-        # ----------------------------------------------------
-        # Retry once, using the same command as the main
-        # backup pass (mc mirror), not mc cp.
-        # ----------------------------------------------------
-
-        if mc mirror \
-            --overwrite \
-            "$SOURCE_URL" \
-            "$RETRY_DEST"; then
-
-            echo "RETRY SUCCESS:"
-            echo "  $SOURCE_URL"
-
-            printf '%s\n' "$SOURCE_URL" >> "$RETRY_SUCCESS_FILE"
-
-            RETRY_SUCCESS_COUNT=$((RETRY_SUCCESS_COUNT + 1))
-
-        else
-
-            echo "RETRY FAILED:"
-            echo "  $SOURCE_URL"
-
-            printf '%s\n' "$SOURCE_URL" >> "$RETRY_FAILED_FILE"
-
-            RETRY_FAILED_COUNT=$((RETRY_FAILED_COUNT + 1))
-        fi
-
-    done < "$FAILED_OBJECTS_FILE"
-
 fi
 
 # ============================================================
