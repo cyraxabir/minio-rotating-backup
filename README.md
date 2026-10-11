@@ -65,7 +65,8 @@ LOG_FILE="${LOG_DIR}/backup-${TODAY}.log"
 Example:
 
 ```text
-/MINIO-BACKUP/logs/backup-2026-09-14.log
+/<MINIO-BACKUP-DIR>/logs/backup-2026-09-14.log
+/<MINIO-BACKUP-DIR>/logs/backup-2026-10-11.retry-failed-objects.log
 ```
 
 ---
