@@ -5,6 +5,7 @@ This script performs daily backups of all buckets from a MinIO server to a local
 The workflow is designed to:
 
 * Back up all MinIO buckets.
+* Skip bucket to backup storage
 * Synchronize the latest/current objects.
 * Reuse existing dated backup directories on a 2-day rotation.
 * Create as many date-based directories as required inside BACKUP_ROOT dir to support the rotation, using the format YYYY-MM-DD (e.g., 2026-09-15).
@@ -40,6 +41,14 @@ DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
 ```
 
 `DISCORD_WEBHOOK_URL` is used only if objects are still failed after the retry pass (see [step 16](#16-discord-failure-notification)). Leave it empty (`DISCORD_WEBHOOK_URL=""`) to disable notifications entirely.
+
+## Buckets to skip backup
+```bash
+SKIP_BUCKETS=(
+     "<bucket-name-1>"
+     "<bucket-name-2>"
+)
+```
 
 It also generates the current date:
 

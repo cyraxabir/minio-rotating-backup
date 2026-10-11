@@ -1,122 +1,135 @@
 #!/usr/bin/env bash
 
 set -u
+set -o pipefail
 
 # ============================================================
 # MinIO 2-Day Rotating Backup
 #
-# Source:
-#   MinIO alias: <your-minio-alias>
+# Main backup:
+#   mc mirror --remove --overwrite --skip-errors
 #
-# Destination:
-#   /MINIO-BACKUP/YYYY-MM-DD/<bucket>
+# Failed-object handling:
+#   1. Capture every "Failed to copy" object reported by mc.
+#   2. After ALL buckets finish, retry ONLY those objects with mc mirror.
+#   3. The persistent retry-failed log contains ONLY objects that
+#      still fail after the dedicated retry.
 #
-# Strategy:
-#   1. Keep two backup directories.
-#   2. Find the oldest backup directory.
-#   3. Mirror current MinIO data into that directory.
-#   4. Individual object failures do NOT stop the backup.
-#   5. Continue processing all buckets.
-#   6. Rename the backup directory to today's date.
-#   7. Retry every failed object ONCE after the main backup.
-#   8. Report successful and permanently failed retries.
-#   9. If any objects are still failed after retry, notify a
-#      Discord webhook with the failure count and log path.
+# Persistent logs:
+#   /MINIO-BACKUP/logs/backup-YYYY-MM-DD.log
+#   /MINIO-BACKUP/logs/backup-YYYY-MM-DD.retry-failed-objects.log
 #
-# IMPORTANT:
-#   Object-level failures are treated as warnings, not
-#   whole-backup failures.
-#
-#   Infrastructure failures still cause the script to exit 1:
-#   - mc missing
-#   - MinIO alias unavailable
-#   - bucket list unavailable
-#   - backup directory rename failure
+# No "find" scan of the millions of objects is used.
+# No "mc cp" is used for backup or retry.
 # ============================================================
 
 # -----------------------------
 # Configuration
 # -----------------------------
-MINIO_ALIAS="<your-minio-alias>"
-BACKUP_ROOT="/MINIO-BACKUP"
+MINIO_ALIAS="<alias-name>"
+BACKUP_ROOT="/<backup-dir>"
 LOG_DIR="${BACKUP_ROOT}/logs"
 LOCK_FILE="/tmp/minio-backup.lock"
 
-# Discord webhook URL for failure notifications.
-# Leave empty to disable notifications entirely.
-DISCORD_WEBHOOK_URL="<your-discord-webhook-url>"
+# Buckets to skip completely.
+# Example:
+# SKIP_BUCKETS=(
+#     "test-bucket"
+#     "temporary-bucket"
+# )
+SKIP_BUCKETS=(
+     "<bucket-name-1>"
+     "<bucket-name-2>"
+)
 
+# Optional Discord webhook.
+# Set it in the environment, do not hard-code the secret:
+# export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+# DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL:-}"
+DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/************"
 TODAY="$(date '+%Y-%m-%d')"
 LOG_FILE="${LOG_DIR}/backup-${TODAY}.log"
+FINAL_FAILED_FILE="${LOG_DIR}/backup-${TODAY}.retry-failed-objects.log"
 
 # -----------------------------
 # Prepare directories
 # -----------------------------
-mkdir -p "$BACKUP_ROOT"
-mkdir -p "$LOG_DIR"
+mkdir -p "$BACKUP_ROOT" "$LOG_DIR"
+
+# The final retry-failed list is the only second persistent log.
+: > "$FINAL_FAILED_FILE"
 
 # -----------------------------
-# Temporary working directory
+# Temporary working files
 # -----------------------------
 TMP_DIR="$(mktemp -d "${BACKUP_ROOT}/.backup-tmp-XXXXXX")"
 
-FAILED_OBJECTS_FILE="${TMP_DIR}/failed_objects.txt"
-RETRY_SUCCESS_FILE="${TMP_DIR}/retry_success.txt"
-RETRY_FAILED_FILE="${TMP_DIR}/retry_failed.txt"
-BUCKET_ERRORS_FILE="${TMP_DIR}/bucket_errors.txt"
+FAILED_RAW_FILE="${TMP_DIR}/failed-raw.txt"
+FAILED_OBJECTS_FILE="${TMP_DIR}/failed-objects.txt"
+RETRY_SUCCESS_FILE="${TMP_DIR}/retry-success.txt"
+BUCKET_ERRORS_FILE="${TMP_DIR}/bucket-errors.txt"
 
-touch "$FAILED_OBJECTS_FILE"
-touch "$RETRY_SUCCESS_FILE"
-touch "$RETRY_FAILED_FILE"
-touch "$BUCKET_ERRORS_FILE"
+: > "$FAILED_RAW_FILE"
+: > "$FAILED_OBJECTS_FILE"
+: > "$RETRY_SUCCESS_FILE"
+: > "$BUCKET_ERRORS_FILE"
 
 cleanup() {
     rm -rf -- "$TMP_DIR"
 }
-
 trap cleanup EXIT
 
 # -----------------------------
 # Discord notification
-#
-# Sends a message to the configured Discord webhook.
-# Failures to notify are logged but never abort the backup.
 # -----------------------------
 send_discord_notification() {
     local MESSAGE="$1"
+    local PAYLOAD
 
     if [ -z "$DISCORD_WEBHOOK_URL" ]; then
-        echo "NOTICE: DISCORD_WEBHOOK_URL is not set, skipping notification."
+        echo "NOTICE: DISCORD_WEBHOOK_URL is not set; notification skipped."
         return 0
     fi
 
     if ! command -v curl >/dev/null 2>&1; then
-        echo "WARNING: curl not found, cannot send Discord notification."
+        echo "WARNING: curl not found; cannot send Discord notification."
         return 1
     fi
 
-    local PAYLOAD
-    PAYLOAD=$(printf '{"content": %s}' "$(
-        printf '%s' "$MESSAGE" |
-        python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null
-    )")
-
-    # Fallback if python3 is unavailable: minimal manual JSON escaping.
-    if [ -z "$PAYLOAD" ] || [ "$PAYLOAD" = '{"content": }' ]; then
-        local ESCAPED
-        ESCAPED=$(printf '%s' "$MESSAGE" | sed 's/\\/\\\\/g; s/"/\\"/g' | awk '{printf "%s\\n", $0}')
-        PAYLOAD="{\"content\": \"${ESCAPED}\"}"
-    fi
+    PAYLOAD="$(
+        python3 - "$MESSAGE" <<'PY'
+import json
+import sys
+print(json.dumps({"content": sys.argv[1]}))
+PY
+    )"
 
     if curl -fsS -X POST \
         -H "Content-Type: application/json" \
         -d "$PAYLOAD" \
         "$DISCORD_WEBHOOK_URL" >/dev/null 2>&1; then
-
         echo "NOTICE: Discord notification sent."
-    else
-        echo "WARNING: Failed to send Discord notification."
+        return 0
     fi
+
+    echo "WARNING: Failed to send Discord notification."
+    return 1
+}
+
+# -----------------------------
+# Helpers
+# -----------------------------
+is_skipped_bucket() {
+    local bucket="$1"
+    local skip_bucket
+
+    for skip_bucket in "${SKIP_BUCKETS[@]}"; do
+        if [ "$bucket" = "$skip_bucket" ]; then
+            return 0
+        fi
+    done
+
+    return 1
 }
 
 # -----------------------------
@@ -140,16 +153,32 @@ if ! flock -n 200; then
 fi
 
 # -----------------------------
-# Check mc
+# Dependency checks
 # -----------------------------
 if ! command -v mc >/dev/null 2>&1; then
     echo "ERROR: mc command not found."
     exit 1
 fi
 
-# -----------------------------
-# Check MinIO alias
-# -----------------------------
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: python3 is required."
+    exit 1
+fi
+
+# Verify --skip-errors without using grep -q in a pipe.
+# This script uses "set -o pipefail", and grep -q can close the pipe
+# early and make a supported mc command appear to have failed.
+MC_MIRROR_HELP="$(mc mirror --help 2>&1)" || {
+    echo "ERROR: Unable to read 'mc mirror --help'."
+    exit 1
+}
+
+if ! grep -Fq -- '--skip-errors' <<< "$MC_MIRROR_HELP"; then
+    echo "ERROR: Installed mc does not support --skip-errors."
+    echo "ERROR: Update mc before running this backup."
+    exit 1
+fi
+
 if ! mc alias list "$MINIO_ALIAS" >/dev/null 2>&1; then
     echo "ERROR: MinIO alias '$MINIO_ALIAS' is not available."
     exit 1
@@ -159,18 +188,17 @@ echo "MinIO alias : $MINIO_ALIAS"
 echo "Backup root : $BACKUP_ROOT"
 echo "Today's date: $TODAY"
 
-# ============================================================
+# -----------------------------
 # Get bucket list
-# ============================================================
-
+# -----------------------------
 echo
 echo "Getting bucket list..."
 
-BUCKET_LIST=$(
+BUCKET_LIST="$(
     mc ls "$MINIO_ALIAS" 2>/dev/null |
     awk '{print $NF}' |
     sed 's:/$::'
-)
+)"
 
 if [ -z "$BUCKET_LIST" ]; then
     echo "ERROR: No buckets found or unable to list buckets."
@@ -180,20 +208,17 @@ fi
 echo "Buckets:"
 echo "$BUCKET_LIST"
 
-# ============================================================
-# Find backup directories
-# Only YYYY-MM-DD directories
-# ============================================================
-
+# -----------------------------
+# Find existing backup directories
+# -----------------------------
+# Shell glob checks only the backup root.
+# It does not scan bucket/object contents.
+# -----------------------------
 mapfile -t BACKUPS < <(
-    find "$BACKUP_ROOT" \
-        -mindepth 1 \
-        -maxdepth 1 \
-        -type d \
-        -regextype posix-extended \
-        -regex '.*/[0-9]{4}-[0-9]{2}-[0-9]{2}' \
-        -printf '%f\n' |
-    sort
+    for path in "$BACKUP_ROOT"/????-??-??; do
+        [ -d "$path" ] || continue
+        printf '%s\n' "${path##*/}"
+    done | sort
 )
 
 BACKUP_COUNT=${#BACKUPS[@]}
@@ -205,65 +230,45 @@ for backup in "${BACKUPS[@]}"; do
     echo "  $backup"
 done
 
-# ============================================================
-# Determine directory to reuse
-# ============================================================
-
+# -----------------------------
+# Determine target directory
+# -----------------------------
 if [ "$BACKUP_COUNT" -eq 0 ]; then
+    TARGET_DIR="${BACKUP_ROOT}/${TODAY}"
+    mkdir -p "$TARGET_DIR"
 
     echo
     echo "No previous backup found."
-    echo "Creating first backup: $TODAY"
-
-    TARGET_DIR="${BACKUP_ROOT}/${TODAY}"
-
-    mkdir -p "$TARGET_DIR"
+    echo "Creating first backup: $TARGET_DIR"
 
 elif [ "$BACKUP_COUNT" -eq 1 ]; then
-
     EXISTING="${BACKUPS[0]}"
 
-    # If today's backup already exists, resume it.
     if [ "$EXISTING" = "$TODAY" ]; then
-
         TARGET_DIR="${BACKUP_ROOT}/${TODAY}"
-
         echo
         echo "Today's backup already exists."
         echo "Resuming backup: $TARGET_DIR"
-
     else
-
+        TARGET_DIR="${BACKUP_ROOT}/${EXISTING}"
         echo
         echo "One previous backup exists: $EXISTING"
         echo "Reusing it for today's backup."
-
-        TARGET_DIR="${BACKUP_ROOT}/${EXISTING}"
     fi
 
 else
-
-    # Two or more backups exist.
-    # The oldest one will be reused.
-
     OLDEST="${BACKUPS[0]}"
 
-    # If today's backup already exists, resume it.
     if [ -d "${BACKUP_ROOT}/${TODAY}" ]; then
-
+        TARGET_DIR="${BACKUP_ROOT}/${TODAY}"
         echo
         echo "Today's backup directory already exists."
-        echo "Resuming: ${BACKUP_ROOT}/${TODAY}"
-
-        TARGET_DIR="${BACKUP_ROOT}/${TODAY}"
-
+        echo "Resuming: $TARGET_DIR"
     else
-
+        TARGET_DIR="${BACKUP_ROOT}/${OLDEST}"
         echo
         echo "Oldest backup: $OLDEST"
         echo "This directory will be reused."
-
-        TARGET_DIR="${BACKUP_ROOT}/${OLDEST}"
     fi
 fi
 
@@ -271,24 +276,35 @@ echo
 echo "Target directory:"
 echo "  $TARGET_DIR"
 
-# ============================================================
+# -----------------------------
 # Counters
-# ============================================================
-
+# -----------------------------
 BUCKET_COUNT=0
 BUCKET_SUCCESS=0
 BUCKET_WARNING=0
+BUCKET_SKIPPED_COUNT=0
 FAILED_OBJECT_COUNT=0
 RETRY_SUCCESS_COUNT=0
 RETRY_FAILED_COUNT=0
 
 # ============================================================
-# Mirror every bucket
+# MAIN MIRROR
 # ============================================================
+echo
+echo "============================================================"
+echo "MAIN MIRROR"
+echo "============================================================"
+echo "Object failures will be skipped and collected for one retry pass."
 
 while IFS= read -r BUCKET; do
-
     [ -z "$BUCKET" ] && continue
+
+    if is_skipped_bucket "$BUCKET"; then
+        echo
+        echo "SKIPPED BUCKET: $BUCKET"
+        BUCKET_SKIPPED_COUNT=$((BUCKET_SKIPPED_COUNT + 1))
+        continue
+    fi
 
     BUCKET_COUNT=$((BUCKET_COUNT + 1))
 
@@ -304,239 +320,275 @@ while IFS= read -r BUCKET; do
 
     mkdir -p "$DEST"
 
-    # --------------------------------------------------------
-    # Run mirror
+    # --skip-errors is intentional:
+    # one failed object does not stop processing the rest of the bucket.
     #
-    # Output is captured first so that failed object paths
-    # can be extracted reliably.
-    # --------------------------------------------------------
-
+    # No --retry here. Retry is handled separately after ALL buckets.
     mc mirror \
         --remove \
         --overwrite \
+        --skip-errors \
         "${MINIO_ALIAS}/${BUCKET}/" \
         "$DEST/" \
         >"$BUCKET_OUTPUT" 2>&1
 
     MIRROR_RC=$?
 
-    # Write normal mc output to main log.
+    # Keep all normal mc output in the main log.
     cat "$BUCKET_OUTPUT"
 
-    # --------------------------------------------------------
-    # Extract object-level copy failures.
+    # Current mc mirror reports source-object copy failures as:
+    #   Failed to copy `SOURCE`
     #
-    # Expected format:
-    #   mc: <ERROR> Failed to copy `https://.../bucket/object`
-    # --------------------------------------------------------
+    # Capture those failed object sources for the dedicated retry.
+    awk '
+        /Failed to copy `/ {
+            line = $0
+            sub(/^.*Failed to copy `/, "", line)
+            sub(/`.*/, "", line)
+            if (line != "") print line
+            next
+        }
 
-    while IFS= read -r FAILED_SOURCE; do
-
-        [ -z "$FAILED_SOURCE" ] && continue
-
-        # Avoid duplicate failed objects.
-        if ! grep -Fqx "$FAILED_SOURCE" "$FAILED_OBJECTS_FILE"; then
-
-            printf '%s\n' "$FAILED_SOURCE" >> "$FAILED_OBJECTS_FILE"
-
-            FAILED_OBJECT_COUNT=$((FAILED_OBJECT_COUNT + 1))
-
-            echo "WARNING: Failed object queued for retry:"
-            echo "  $FAILED_SOURCE"
-        fi
-
-    done < <(
-        sed -n \
-            's/.*Failed to copy `\([^`]*\)`.*/\1/p' \
-            "$BUCKET_OUTPUT"
-    )
-
-    # --------------------------------------------------------
-    # Bucket result
-    #
-    # IMPORTANT:
-    # A non-zero mc mirror exit code does NOT automatically
-    # mean the whole backup failed.
-    # --------------------------------------------------------
+        /Failed to copy / {
+            line = $0
+            sub(/^.*Failed to copy[[:space:]]+/, "", line)
+            sub(/[[:space:]].*$/, "", line)
+            gsub(/^`|`$/, "", line)
+            if (line != "") print line
+        }
+    ' "$BUCKET_OUTPUT" >> "$FAILED_RAW_FILE"
 
     if [ "$MIRROR_RC" -eq 0 ]; then
-
-        echo "SUCCESS: Bucket completed successfully."
+        echo "SUCCESS: Bucket mirror completed."
         BUCKET_SUCCESS=$((BUCKET_SUCCESS + 1))
-
     else
+        echo "WARNING: mc mirror returned exit code $MIRROR_RC."
+        echo "WARNING: Bucket processing continues."
 
+        printf '%s\t%s\n' "$BUCKET" "$MIRROR_RC" >> "$BUCKET_ERRORS_FILE"
         BUCKET_WARNING=$((BUCKET_WARNING + 1))
-
-        printf '%s\t%s\n' "$BUCKET" "$MIRROR_RC" \
-            >> "$BUCKET_ERRORS_FILE"
-
-        echo
-        echo "WARNING: mc mirror returned exit code $MIRROR_RC"
-        echo "WARNING: Bucket backup processing will continue."
-        echo "WARNING: Any failed objects have been added to the retry queue."
-
     fi
 
 done <<< "$BUCKET_LIST"
 
 # ============================================================
-# Main backup completed
+# BUILD UNIQUE FAILED-OBJECT LIST
 # ============================================================
-
 echo
 echo "============================================================"
-echo "MAIN BACKUP PROCESS COMPLETED"
+echo "COLLECTING FAILED OBJECTS"
 echo "============================================================"
 
-echo "Buckets processed          : $BUCKET_COUNT"
-echo "Buckets fully successful   : $BUCKET_SUCCESS"
-echo "Buckets with warnings      : $BUCKET_WARNING"
-echo "Failed objects queued      : $FAILED_OBJECT_COUNT"
-echo
+if [ -s "$FAILED_RAW_FILE" ]; then
 
-echo "All buckets have been processed."
-echo "The retry pass will run next; the backup directory is"
-echo "finalized (renamed to today's date) only after that."
+    # Convert reported URLs/paths into:
+    #   minio-231-backup/bucket/object
+    python3 \
+        "$FAILED_RAW_FILE" \
+        "$FAILED_OBJECTS_FILE" \
+        "$MINIO_ALIAS" <<'PY'
+import sys
+from urllib.parse import unquote, urlsplit
+
+raw_file, out_file, alias = sys.argv[1:4]
+seen = set()
+
+with open(raw_file, "r", encoding="utf-8", errors="replace") as src, \
+     open(out_file, "w", encoding="utf-8") as dst:
+
+    for raw in src:
+        value = raw.rstrip("\r\n")
+
+        if not value:
+            continue
+
+        if "://" in value:
+            parsed = urlsplit(value)
+            path = unquote(parsed.path.lstrip("/"))
+        else:
+            path = value
+
+        prefix = alias + "/"
+        if path.startswith(prefix):
+            path = path[len(prefix):]
+
+        if "/" not in path:
+            continue
+
+        canonical = alias + "/" + path
+
+        if canonical not in seen:
+            seen.add(canonical)
+            dst.write(canonical + "\n")
+PY
+
+    sort -u "$FAILED_OBJECTS_FILE" -o "$FAILED_OBJECTS_FILE"
+fi
+
+FAILED_OBJECT_COUNT="$(wc -l < "$FAILED_OBJECTS_FILE" | tr -d ' ')"
+
+if [ -z "$FAILED_OBJECT_COUNT" ]; then
+    FAILED_OBJECT_COUNT=0
+fi
+
+echo "Objects initially failed: $FAILED_OBJECT_COUNT"
+
+if [ "$FAILED_OBJECT_COUNT" -gt 0 ]; then
+    echo
+    echo "Failed objects queued for dedicated retry:"
+    while IFS= read -r FAILED_OBJECT; do
+        [ -z "$FAILED_OBJECT" ] && continue
+        echo "  $FAILED_OBJECT"
+    done < "$FAILED_OBJECTS_FILE"
+else
+    echo "No object-level failures were reported by the main mirror."
+fi
 
 # ============================================================
-# Retry failed objects ONCE
-#
-# NOTE:
-#   mc mirror only accepts a FOLDER as its source and cannot
-#   be pointed at a single object (it errors with "Source ...
-#   is not a folder. Only folders are supported by mirror
-#   command."). mc cp is built for exactly the opposite case:
-#   copying one specific object. Since this retry pulls a
-#   single object FROM the bucket DOWN to local disk (the same
-#   direction as the main backup), mc cp is the correct tool
-#   here.
+# DEDICATED RETRY - ONLY FAILED OBJECTS
 # ============================================================
-
 echo
 echo "============================================================"
-echo "FAILED OBJECT RETRY PASS"
+echo "DEDICATED RETRY OF FAILED OBJECTS"
 echo "============================================================"
+echo "Retry uses mc mirror only. No mc cp is used."
 
-if [ ! -s "$FAILED_OBJECTS_FILE" ]; then
-
+if [ "$FAILED_OBJECT_COUNT" -eq 0 ]; then
     echo "No failed objects require retry."
 
 else
 
     while IFS= read -r SOURCE_PATH; do
-
         [ -z "$SOURCE_PATH" ] && continue
 
         echo
         echo "------------------------------------------------------------"
-        echo "Retrying failed object:"
+        echo "Retrying:"
         echo "  $SOURCE_PATH"
         echo "------------------------------------------------------------"
 
-        # ----------------------------------------------------
-        # Parse bucket/object regardless of whether mc reported
-        # the source as "<alias>/<bucket>/<key>" or as a full
-        # URL ("scheme://host/<bucket>/<key>").
-        # ----------------------------------------------------
-
-        if [[ "$SOURCE_PATH" == *"://"* ]]; then
-            SOURCE_REST="${SOURCE_PATH#*://}"
-            REL_PATH="${SOURCE_REST#*/}"
-        else
-            REL_PATH="${SOURCE_PATH#"${MINIO_ALIAS}/"}"
-        fi
-
+        REL_PATH="${SOURCE_PATH#"${MINIO_ALIAS}/"}"
         SPLIT_BUCKET="${REL_PATH%%/*}"
         SPLIT_OBJECT="${REL_PATH#*/}"
 
-        if [ -z "$SPLIT_BUCKET" ] || [ -z "$SPLIT_OBJECT" ] || [ "$SPLIT_OBJECT" = "$REL_PATH" ]; then
+        if [ -z "$SPLIT_BUCKET" ] || \
+           [ -z "$SPLIT_OBJECT" ] || \
+           [ "$SPLIT_OBJECT" = "$REL_PATH" ]; then
 
-            echo "ERROR: Could not determine bucket/object from:"
+            echo "ERROR: Could not determine bucket/object:"
             echo "  $SOURCE_PATH"
 
-            printf '%s\n' "$SOURCE_PATH" >> "$RETRY_FAILED_FILE"
+            printf '%s\n' "$SOURCE_PATH" >> "$FINAL_FAILED_FILE"
             RETRY_FAILED_COUNT=$((RETRY_FAILED_COUNT + 1))
-
             continue
         fi
 
-        # ----------------------------------------------------
-        # Decode common %XX sequences. Harmless no-op if the
-        # object key contains no such sequences.
-        # ----------------------------------------------------
-
-        DECODED_OBJECT="$(
-            printf '%b' "${SPLIT_OBJECT//%/\\x}" 2>/dev/null
-        )"
-
-        if [ -n "$DECODED_OBJECT" ]; then
-            SPLIT_OBJECT="$DECODED_OBJECT"
-        fi
-
         RETRY_SOURCE="${MINIO_ALIAS}/${SPLIT_BUCKET}/${SPLIT_OBJECT}"
-        RETRY_DEST="${TARGET_DIR}/${SPLIT_BUCKET}/${SPLIT_OBJECT}"
 
-        mkdir -p "$(dirname "$RETRY_DEST")"
+        case "$SPLIT_OBJECT" in
+            */*)
+                OBJECT_DIR="${SPLIT_OBJECT%/*}"
+                RETRY_DEST_DIR="${TARGET_DIR}/${SPLIT_BUCKET}/${OBJECT_DIR}"
+                ;;
+            *)
+                RETRY_DEST_DIR="${TARGET_DIR}/${SPLIT_BUCKET}"
+                ;;
+        esac
+
+        mkdir -p "$RETRY_DEST_DIR"
 
         echo "Retry source:"
         echo "  $RETRY_SOURCE"
         echo "Retry destination:"
-        echo "  $RETRY_DEST"
+        echo "  $RETRY_DEST_DIR"
 
-        # ----------------------------------------------------
-        # Retry once, using mc cp for this single object.
-        # ----------------------------------------------------
-
-        if mc cp \
+        # SOURCE may be an individual S3 object.
+        # TARGET is the local directory for that object.
+        if mc mirror \
+            --overwrite \
             "$RETRY_SOURCE" \
-            "$RETRY_DEST"; then
+            "$RETRY_DEST_DIR/"; then
 
-            echo "RETRY SUCCESS:"
-            echo "  $SOURCE_PATH"
-
+            echo "RETRY SUCCESS: $SOURCE_PATH"
             printf '%s\n' "$SOURCE_PATH" >> "$RETRY_SUCCESS_FILE"
             RETRY_SUCCESS_COUNT=$((RETRY_SUCCESS_COUNT + 1))
 
         else
 
-            echo "RETRY FAILED:"
-            echo "  $SOURCE_PATH"
-
-            printf '%s\n' "$SOURCE_PATH" >> "$RETRY_FAILED_FILE"
+            echo "RETRY FAILED: $SOURCE_PATH"
+            printf '%s\n' "$SOURCE_PATH" >> "$FINAL_FAILED_FILE"
             RETRY_FAILED_COUNT=$((RETRY_FAILED_COUNT + 1))
         fi
 
     done < "$FAILED_OBJECTS_FILE"
+fi
 
+# Final failed list must contain only objects that still failed.
+if [ -s "$FINAL_FAILED_FILE" ]; then
+    sort -u "$FINAL_FAILED_FILE" -o "$FINAL_FAILED_FILE"
+    RETRY_FAILED_COUNT="$(wc -l < "$FINAL_FAILED_FILE" | tr -d ' ')"
+else
+    : > "$FINAL_FAILED_FILE"
+    RETRY_FAILED_COUNT=0
+fi
+
+if [ -s "$RETRY_SUCCESS_FILE" ]; then
+    sort -u "$RETRY_SUCCESS_FILE" -o "$RETRY_SUCCESS_FILE"
+    RETRY_SUCCESS_COUNT="$(wc -l < "$RETRY_SUCCESS_FILE" | tr -d ' ')"
+else
+    RETRY_SUCCESS_COUNT=0
 fi
 
 # ============================================================
-# Finalize: rename the working directory to today's date
-#
-# NOTE:
-#   This happens ONLY NOW — after both the main backup AND the
-#   retry pass have fully completed. If the script were to
-#   crash mid-retry, the directory would still carry its old
-#   (in-progress) name, so the next run correctly detects it
-#   as unfinished and resumes it, instead of a half-retried
-#   backup being mistaken for a completed one stamped with
-#   today's date.
+# SUMMARY
 # ============================================================
+echo
+echo "============================================================"
+echo "MAIN BACKUP + RETRY COMPLETED"
+echo "============================================================"
+echo "Buckets processed          : $BUCKET_COUNT"
+echo "Buckets successful         : $BUCKET_SUCCESS"
+echo "Buckets with warnings     : $BUCKET_WARNING"
+echo "Buckets skipped            : $BUCKET_SKIPPED_COUNT"
+echo "Objects initially failed  : $FAILED_OBJECT_COUNT"
+echo "Objects recovered on retry: $RETRY_SUCCESS_COUNT"
+echo "Objects still failed      : $RETRY_FAILED_COUNT"
+echo
+echo "Main log:"
+echo "  $LOG_FILE"
+echo
+echo "Final retry-failed object list:"
+echo "  $FINAL_FAILED_FILE"
 
+if [ -s "$FINAL_FAILED_FILE" ]; then
+    echo
+    echo "------------------------------------------------------------"
+    echo "OBJECTS STILL FAILED AFTER RETRY"
+    echo "------------------------------------------------------------"
+
+    while IFS= read -r PERMANENT_OBJECT; do
+        [ -z "$PERMANENT_OBJECT" ] && continue
+        echo "  $PERMANENT_OBJECT"
+    done < "$FINAL_FAILED_FILE"
+else
+    echo
+    echo "No objects remained failed after the dedicated retry."
+fi
+
+# ============================================================
+# FINALIZE BACKUP DIRECTORY
+# ============================================================
 FINAL_DIR="${BACKUP_ROOT}/${TODAY}"
 CURRENT_NAME="$(basename "$TARGET_DIR")"
 
 if [ "$CURRENT_NAME" != "$TODAY" ]; then
 
     if [ -e "$FINAL_DIR" ]; then
-
         echo
         echo "ERROR: Today's directory already exists:"
         echo "  $FINAL_DIR"
-        echo
         echo "Refusing to overwrite it."
-
         exit 1
     fi
 
@@ -547,13 +599,9 @@ if [ "$CURRENT_NAME" != "$TODAY" ]; then
     echo "  $FINAL_DIR"
 
     if mv -- "$TARGET_DIR" "$FINAL_DIR"; then
-
         TARGET_DIR="$FINAL_DIR"
-
         echo "SUCCESS: Backup directory renamed."
-
     else
-
         echo "ERROR: Failed to rename backup directory."
         exit 1
     fi
@@ -566,143 +614,41 @@ else
 fi
 
 # ============================================================
-# Current backups
-#
-# NOTE:
-#   No retention deletion is performed here. Renaming the
-#   oldest backup directory to today's date (above) already
-#   retires the older snapshot's contents as buckets are
-#   re-mirrored into it, so there is nothing left to delete.
+# CURRENT BACKUPS
 # ============================================================
-
 echo
 echo "============================================================"
 echo "CURRENT BACKUPS"
 echo "============================================================"
 
-find "$BACKUP_ROOT" \
-    -mindepth 1 \
-    -maxdepth 1 \
-    -type d \
-    -regextype posix-extended \
-    -regex '.*/[0-9]{4}-[0-9]{2}-[0-9]{2}' \
-    -printf '  %f\n' |
-sort
+for path in "$BACKUP_ROOT"/????-??-??; do
+    [ -d "$path" ] || continue
+    printf '  %s\n' "${path##*/}"
+done | sort
 
 # ============================================================
-# FINAL ERROR / RETRY SUMMARY
+# BUCKET-LEVEL WARNINGS
 # ============================================================
-
-echo
-echo
-echo "============================================================"
-echo "FINAL BACKUP ERROR / RETRY SUMMARY"
-echo "============================================================"
-
-echo
-echo "Main backup:"
-echo "  Buckets processed       : $BUCKET_COUNT"
-echo "  Buckets fully successful: $BUCKET_SUCCESS"
-echo "  Buckets with warnings   : $BUCKET_WARNING"
-echo "  Objects initially failed: $FAILED_OBJECT_COUNT"
-
-echo
-echo "Retry results:"
-echo "  Retry succeeded         : $RETRY_SUCCESS_COUNT"
-echo "  Retry permanently failed: $RETRY_FAILED_COUNT"
-
-# ------------------------------------------------------------
-# Bucket-level warnings
-# ------------------------------------------------------------
-
 if [ -s "$BUCKET_ERRORS_FILE" ]; then
-
     echo
     echo "------------------------------------------------------------"
     echo "BUCKET-LEVEL WARNINGS"
     echo "------------------------------------------------------------"
 
     while IFS=$'\t' read -r ERROR_BUCKET ERROR_RC; do
-
         echo "Bucket: $ERROR_BUCKET"
         echo "mc exit code: $ERROR_RC"
         echo
-
     done < "$BUCKET_ERRORS_FILE"
 
 else
-
     echo
     echo "No bucket-level warnings."
 fi
 
-# ------------------------------------------------------------
-# Initially failed objects
-# ------------------------------------------------------------
-
-if [ -s "$FAILED_OBJECTS_FILE" ]; then
-
-    echo
-    echo "------------------------------------------------------------"
-    echo "OBJECTS THAT FAILED DURING MAIN BACKUP"
-    echo "------------------------------------------------------------"
-
-    while IFS= read -r FAILED_OBJECT; do
-        echo "  $FAILED_OBJECT"
-    done < "$FAILED_OBJECTS_FILE"
-
-else
-
-    echo
-    echo "No object failures during main backup."
-fi
-
-# ------------------------------------------------------------
-# Retry successes
-# ------------------------------------------------------------
-
-if [ -s "$RETRY_SUCCESS_FILE" ]; then
-
-    echo
-    echo "------------------------------------------------------------"
-    echo "OBJECTS RECOVERED DURING RETRY"
-    echo "------------------------------------------------------------"
-
-    while IFS= read -r RETRY_OBJECT; do
-        echo "  $RETRY_OBJECT"
-    done < "$RETRY_SUCCESS_FILE"
-
-else
-
-    echo
-    echo "No objects recovered during retry."
-fi
-
-# ------------------------------------------------------------
-# Permanent failures
-# ------------------------------------------------------------
-
-if [ -s "$RETRY_FAILED_FILE" ]; then
-
-    echo
-    echo "------------------------------------------------------------"
-    echo "OBJECTS STILL FAILED AFTER RETRY"
-    echo "------------------------------------------------------------"
-
-    while IFS= read -r PERMANENT_OBJECT; do
-        echo "  $PERMANENT_OBJECT"
-    done < "$RETRY_FAILED_FILE"
-
-else
-
-    echo
-    echo "No objects remained failed after retry."
-fi
-
 # ============================================================
-# Final status
+# FINAL STATUS
 # ============================================================
-
 echo
 echo "============================================================"
 
@@ -710,37 +656,33 @@ if [ "$RETRY_FAILED_COUNT" -gt 0 ]; then
 
     echo "MinIO Backup Completed With Object Warnings"
 
-    # --------------------------------------------------------
-    # Notify Discord: objects are still missing after retry.
-    # --------------------------------------------------------
-
-    DISCORD_MESSAGE=$(printf \
-        ':warning: **MinIO Backup Warning** (%s)\n%s object(s) failed to back up even after retry.\nBackup directory: %s\nPlease check the script logs: %s' \
-        "$TODAY" \
-        "$RETRY_FAILED_COUNT" \
-        "$FINAL_DIR" \
-        "$LOG_FILE")
+    DISCORD_MESSAGE="$(
+        printf \
+            ':warning: **MinIO Backup Warning** (%s)\n%s object(s) failed after dedicated mirror retry.\nBackup directory: %s\nRetry-failed object list: %s\nMain log: %s' \
+            "$TODAY" \
+            "$RETRY_FAILED_COUNT" \
+            "$FINAL_DIR" \
+            "$FINAL_FAILED_FILE" \
+            "$LOG_FILE"
+    )"
 
     send_discord_notification "$DISCORD_MESSAGE"
 
 elif [ "$FAILED_OBJECT_COUNT" -gt 0 ]; then
 
     echo "MinIO Backup Completed Successfully"
-    echo "All initially failed objects were recovered during retry"
+    echo "All initially failed objects were recovered during the retry pass."
 
 else
 
     echo "MinIO Backup Completed Successfully"
+    echo "No object-level failures were reported."
+
 fi
 
 echo "Time: $(date)"
 echo "============================================================"
 
-# ------------------------------------------------------------
-# IMPORTANT:
-# Per-object failures do NOT make the whole backup exit 1.
-# The backup is considered completed as long as the main
-# backup process and directory finalization succeeded.
-# ------------------------------------------------------------
-
+# Object failures are warnings and are listed in the logs.
+# Infrastructure failures exit with status 1 above.
 exit 0
